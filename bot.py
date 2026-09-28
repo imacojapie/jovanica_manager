@@ -41,7 +41,10 @@ def put(key, value):
     DB.commit()
 
 def tell(chat, text):
-    return api('sendMessage', chat_id=chat, text=text)
+    result = None
+    for start in range(0, len(text), 2000):
+        result = api('sendMessage', chat_id=chat, text=text[start:start+2000])
+    return result
 
 def connection(cid):
     c = api('getBusinessConnection', business_connection_id=cid)
@@ -55,18 +58,68 @@ def eligible(c, chat):
     if not 0 <= time.time() - chat['date'] < 86400 - 60:
         raise ValueError('Reply window expired. The recipient must message Jovanica again.')
 
-HELP = ('Jovanica PPV Manager v2\n'
-        '/id — your Telegram ID\n/chats — recorded customer chats\n'
-        '/target NUMBER — choose one recipient\n'
-        'Upload ONE photo/video with a caption.\n'
-        '/caption TEXT — replace caption; /caption clears it\n'
-        '/price 99 — set Stars price\n'
-        '/send — review single-recipient offer\n'
-        '/broadcast — review offer for ALL eligible recorded chats\n'
-        '/confirm CODE — approve reviewed offer\n'
-        '/status — delivery summary\n/stopbroadcast — stop remaining sends\n'
-        '/cancel — discard unsent draft\n'
+HELP = ('Jovanica Manager v3 — PPV bundles + text\n'
+        '/newppv — start a fresh photo/video bundle\n'
+        'Upload an album or individual photos/videos (max 10), then /done.\n'
+        '/caption TEXT — set bundle caption\n/price NUMBER — 1–25000 Stars for the WHOLE bundle\n'
+        '/text MESSAGE — create a FREE text-only message\n'
+        '/target NUMBER — choose one recipient\n/send — review single send\n'
+        '/broadcast — review all eligible recipients\n/confirm CODE — approve\n'
+        '/draft — inspect content and item count\n/cancel — discard draft\n'
+        '/chats — recipients\n/stats — counts and storage\n/id — your ID\n'
+        '/status — broadcast progress\n/stopbroadcast — stop remaining sends\n'
         'Recipients can send /stop to Jovanica to opt out, /start to resume.')
+
+def media_items(content):
+    media = content.get('media', [])
+    return [media] if isinstance(media, dict) else media
+
+def validate_content(content):
+    if content.get('kind') == 'text':
+        if not content.get('text') or len(content['text']) > 4096:
+            raise ValueError('Use /text MESSAGE with 1–4096 characters.')
+        return
+    if content.get('collecting'):
+        raise ValueError('Bundle still open. Wait for all uploads, then send /done.')
+    if not 1 <= len(media_items(content)) <= 10:
+        raise ValueError('Upload 1–10 photos/videos first.')
+    if not 1 <= content.get('price', 0) <= 25000:
+        raise ValueError('Set /price NUMBER from 1 to 25000 Stars.')
+    if len(content.get('caption', '')) > 1024:
+        raise ValueError('Caption must be at most 1024 characters.')
+
+def content_description(content):
+    if content.get('kind') == 'text':
+        return 'FREE TEXT MESSAGE (no paywall)\n' + content.get('text', '')
+    return ('PPV bundle: ' + str(len(media_items(content))) + ' item(s)\n'
+            'Price: ' + str(content.get('price', 'NOT SET')) +
+            ' Stars to unlock the WHOLE bundle per recipient\nCaption: ' + content.get('caption', ''))
+
+def deliver(content, cid, chat_id):
+    validate_content(content)
+    if content.get('kind') == 'text':
+        return api('sendMessage', business_connection_id=cid, chat_id=chat_id, text=content['text'])
+    return api('sendPaidMedia', business_connection_id=cid, chat_id=chat_id,
+               star_count=content['price'], media=media_items(content),
+               caption=content.get('caption', ''), protect_content=True)
+
+def initialize_database(path):
+    global DB
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    dbfile = path / 'manager.sqlite3'
+    existing = dbfile.exists()
+    DB = sqlite3.connect(dbfile)
+    if existing:
+        # One backup before the first v3 start, never overwrite an existing backup.
+        backup = path / 'manager-before-v3.sqlite3'
+        if not backup.exists():
+            with sqlite3.connect(backup) as dest:
+                DB.backup(dest)
+    DB.execute('CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+    DB.commit()
+    # No drops, deletes or reset of contacts, offsets, jobs, or drafts.
+
 
 def active(chat):
     return (chat.get('id') != OWNER and not chat.get('opted_out', False)
@@ -113,9 +166,7 @@ def broadcast_tick():
     job['next_at'] = time.time() + 1.1
     put('job', job)
     try:
-        result = api('sendPaidMedia', business_connection_id=row['connection'],
-            chat_id=chat['id'], star_count=job['price'], media=[job['media']],
-            caption=job['caption'], protect_content=True)
+        result = deliver(job, row['connection'], chat['id'])
         row['state'] = 'sent'
         row['message_id'] = result['message_id']
     except APIError as exc:
@@ -170,6 +221,35 @@ def process(uid, m, text):
     draft = get('draft', {})
     if text in ('/start', '/help'):
         tell(uid, HELP)
+    elif text == '/stats':
+        chats = get('chats', {})
+        path = os.environ.get('DATA_DIR', '/data')
+        mount = os.environ.get('RAILWAY_VOLUME_MOUNT_PATH', 'Not reported; check Railway volume settings')
+        tell(uid, 'Recorded chats: ' + str(len(chats)) + '\nEligible now: ' + str(sum(active(c) for c in chats.values())) + '\nDatabase: ' + path + '/manager.sqlite3\nRailway volume mount: ' + mount + '\nExpired chats stay recorded. Telegram contacts are separate.')
+    elif text == '/draft':
+        tell(uid, content_description(draft) + ('\nBundle OPEN — /done when finished.' if draft.get('collecting') else ''))
+    elif text == '/newppv':
+        fresh = {'kind': 'ppv', 'media': [], 'caption': '', 'collecting': True}
+        if 'target' in draft:
+            fresh['target'] = draft['target']
+        put('draft', fresh)
+        tell(uid, 'New PPV bundle. Send up to 10 photos/videos as an album or separately, then /done. Your recipient database is unchanged.')
+    elif text == '/done':
+        if draft.get('kind') == 'text' or not media_items(draft):
+            raise ValueError('Upload photos/videos first, or use /text MESSAGE.')
+        draft['collecting'] = False
+        draft.pop('confirm', None)
+        put('draft', draft)
+        tell(uid, 'Bundle closed: ' + str(len(media_items(draft))) + ' item(s). /caption TEXT, /price NUMBER, then /send or /broadcast.')
+    elif text == '/text' or text.startswith('/text ') or text.startswith('/text\n'):
+        body = text[5:].lstrip()
+        if not body or len(body) > 4096:
+            raise ValueError('Send /text followed by your message, up to 4096 characters. It will be FREE, with no photo or paywall.')
+        fresh = {'kind': 'text', 'text': body}
+        if 'target' in draft:
+            fresh['target'] = draft['target']
+        put('draft', fresh)
+        tell(uid, 'Free text draft saved. /send for one recipient or /broadcast for all eligible chats. Nothing sent yet.')
     elif text == '/chats':
         chats = get('chats', {})
         lines = [str(c['id']) + ' — ' + c['name'] + (' — opted out' if c.get('opted_out') else ' — active' if active(c) else ' — expired') for c in chats.values()]
@@ -183,17 +263,44 @@ def process(uid, m, text):
         put('draft', draft)
         tell(uid, 'Recipient selected. Send one photo/video here, then /price 1.')
     elif m.get('photo') or m.get('video'):
-        if m.get('media_group_id'):
-            raise ValueError('Albums are not supported in this test version. Send one item separately.')
-        media = {'type': 'photo', 'media': m['photo'][-1]['file_id']} if m.get('photo') else {'type': 'video', 'media': m['video']['file_id']}
+        item = {'type': 'photo', 'media': m['photo'][-1]['file_id']} if m.get('photo') else {'type': 'video', 'media': m['video']['file_id']}
+        group = m.get('media_group_id')
+        same_group = bool(group and group == draft.get('album_group'))
+        append = (draft.get('kind') != 'text' and (draft.get('collecting') or same_group))
+        if not append:
+            fresh = {'kind': 'ppv', 'media': [], 'caption': ''}
+            if 'target' in draft:
+                fresh['target'] = draft['target']
+            draft = fresh
+        items = media_items(draft)
+        message_id = m.get('message_id')
+        seen = draft.get('media_message_ids', [])
+        if message_id is not None and message_id in seen:
+            return
+        if len(items) >= 10:
+            draft.pop('confirm', None)
+            draft['collecting'] = True
+            put('draft', draft)
+            raise ValueError('10-item limit reached. Extra item NOT added. Check /draft, then /done to approve the existing 10, or /newppv to start over.')
         caption = m.get('caption', '')
         if len(caption) > 1024:
             raise ValueError('Caption must be at most 1024 characters.')
-        draft.update(media=media, caption=caption)
+        items.append(item)
+        if message_id is not None:
+            seen.append(message_id)
+        draft.update(kind='ppv', media=items, media_message_ids=seen)
+        if caption:
+            draft['caption'] = caption
+        if group:
+            draft['album_group'] = group
+            draft['collecting'] = True
         draft.pop('confirm', None)
         put('draft', draft)
-        tell(uid, 'Media saved. Set price with /price 1, then /send for one recipient or /broadcast for all eligible chats.')
+        tell(uid, 'Saved ' + str(len(items)) + ' item(s).' +
+             (' Upload remaining items, then /done.' if draft.get('collecting') else ' Set /price NUMBER, then /send or /broadcast.'))
     elif text.startswith('/price '):
+        if draft.get('kind') == 'text':
+            raise ValueError('Text-only messages are free. Use /newppv for a paid photo/video bundle.')
         price = int(text.split()[1])
         if not 1 <= price <= 25000:
             raise ValueError('Price must be 1–25000 Stars.')
@@ -202,6 +309,8 @@ def process(uid, m, text):
         put('draft', draft)
         tell(uid, 'Price: ' + str(price) + ' Stars. /send for one recipient or /broadcast for all eligible chats.')
     elif text == '/caption' or text.startswith('/caption '):
+        if draft.get('kind') == 'text':
+            raise ValueError('Use /text MESSAGE to replace the text draft.')
         caption = text.partition(' ')[2]
         if len(caption) > 1024:
             raise ValueError('Caption must be at most 1024 characters.')
@@ -227,8 +336,7 @@ def process(uid, m, text):
     elif text == '/broadcast':
         if get('job', {}).get('state') == 'running':
             raise ValueError('A broadcast is running. Use /status or /stopbroadcast.')
-        if not all(k in draft for k in ('media', 'price')):
-            raise ValueError('Upload one photo/video and set /price first.')
+        validate_content(draft)
         candidates = []
         connections = {}
         chats = get('chats', {})
@@ -248,17 +356,17 @@ def process(uid, m, text):
         draft.update(mode='broadcast', recipients=candidates, confirm=secrets.token_hex(3), expires=time.time()+300)
         put('draft', draft)
         tell(uid, 'BROADCAST FROM JOVANICA\nRecipients: ' + str(len(candidates)) +
-             ' of ' + str(len(chats)) + ' recorded chats\nPrice: ' + str(draft['price']) +
-             ' Stars PER RECIPIENT\nType: ' + draft['media']['type'] + '\nCaption: ' +
-             draft.get('caption', '') + '\n\nThis ignores /target and sends to ALL listed eligible chats.' +
-             '\nAudience is frozen now; expired/unavailable chats will be skipped or rejected.' +
+             ' of ' + str(len(chats)) + ' recorded chats\n' + content_description(draft) +
+             '\n\nThis ignores /target and sends to ALL eligible chats in this frozen list.' +
+             '\nExpired/unavailable chats will be skipped or rejected.' +
              '\nConfirm within 5 minutes: /confirm ' + draft['confirm'] + '\nOr /cancel.')
     elif text == '/cancel':
         put('draft', {})
         tell(uid, 'Draft discarded.')
     elif text == '/send':
-        if not all(k in draft for k in ('target', 'media', 'price')):
-            raise ValueError('Choose /target, upload media, and set /price first.')
+        validate_content(draft)
+        if 'target' not in draft:
+            raise ValueError('Choose /target NUMBER first.')
         chat = get('chats', {})[draft['target']]
         eligible(connection(chat['connection']), chat)
         code = secrets.token_hex(3)
@@ -266,14 +374,16 @@ def process(uid, m, text):
         draft['confirm'] = code
         draft['expires'] = time.time() + 300
         put('draft', draft)
-        tell(uid, 'SEND FROM JOVANICA\nTo: ' + chat['name'] + ' (' + str(chat['id']) + ')\nPrice: ' + str(draft['price']) + ' Stars\nType: ' + draft['media']['type'] + '\nCaption: ' + draft['caption'][:1024] + '\n\nSend /confirm ' + code + ' within 5 minutes, or /cancel.')
+        tell(uid, 'SEND FROM JOVANICA\nTo: ' + chat['name'] + ' (' + str(chat['id']) + ')\n' +
+             content_description(draft) + '\n\nSend /confirm ' + code + ' within 5 minutes, or /cancel.')
     elif text.startswith('/confirm '):
         if text.split()[1] != draft.get('confirm') or time.time() > draft.get('expires', 0):
             raise ValueError('Invalid/expired confirmation. Run /send or /broadcast again.')
+        validate_content(draft)
         if draft.get('mode') == 'broadcast':
             if get('job', {}).get('state') == 'running':
                 raise ValueError('A broadcast is already running.')
-            job = {k: draft[k] for k in ('media', 'price', 'recipients')}
+            job = {k: draft[k] for k in ('media', 'price', 'recipients', 'kind', 'text') if k in draft}
             job.update(id=secrets.token_hex(4), state='running', caption=draft.get('caption', ''), next_at=0)
             # Atomic job creation and confirmation consumption.
             with DB:
@@ -289,15 +399,13 @@ def process(uid, m, text):
         draft.pop('confirm', None)
         put('draft', draft)
         try:
-            result = api('sendPaidMedia', business_connection_id=chat['connection'],
-                chat_id=chat['id'], star_count=draft['price'], media=[draft['media']],
-                caption=draft['caption'][:1024], protect_content=True)
+            result = deliver(draft, chat['connection'], chat['id'])
         except APIError:
             tell(uid, 'Send failed or delivery is uncertain. Check the recipient chat BEFORE trying again. Check reply permission and have recipient send Hi again.')
             return
-        put('last_send', {'message_id': result['message_id'], 'chat': chat['id'], 'price': draft['price']})
+        put('last_send', {'message_id': result['message_id'], 'chat': chat['id'], 'price': draft.get('price', 0)})
         put('draft', {})
-        tell(uid, 'Telegram accepted the paid post. Check your second account to verify the lock, sender, and price.')
+        tell(uid, 'Telegram accepted the message. Check the recipient chat to verify content and sender.')
     else:
         tell(uid, HELP)
 
@@ -305,11 +413,7 @@ def main():
     global DB
     if not TOKEN:
         raise SystemExit('Set BOT_TOKEN in Railway Variables.')
-    path = Path(os.environ.get('DATA_DIR', '/data'))
-    path.mkdir(parents=True, exist_ok=True)
-    DB = sqlite3.connect(path / 'manager.sqlite3')
-    DB.execute('CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
-    DB.commit()
+    initialize_database(os.environ.get('DATA_DIR', '/data'))
     me = api('getMe')
     print('Manager started: @' + me['username'], flush=True)
     if api('getWebhookInfo').get('url'):
