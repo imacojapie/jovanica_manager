@@ -58,7 +58,7 @@ def eligible(c, chat):
     if not 0 <= time.time() - chat['date'] < 86400 - 60:
         raise ValueError('Reply window expired. The recipient must message Jovanica again.')
 
-HELP = ('Jovanica Manager v3 — PPV bundles + text\n'
+HELP = ('Jovanica Manager v4 — buyers + broadcasts\n'
         '/newppv — start a fresh photo/video bundle\n'
         'Upload an album or individual photos/videos (max 10), then /done.\n'
         '/caption TEXT — set bundle caption\n/price NUMBER — 1–25000 Stars for the WHOLE bundle\n'
@@ -66,7 +66,11 @@ HELP = ('Jovanica Manager v3 — PPV bundles + text\n'
         '/target NUMBER — choose one recipient\n/send — review single send\n'
         '/broadcast — review all eligible recipients\n/confirm CODE — approve\n'
         '/draft — inspect content and item count\n/cancel — discard draft\n'
-        '/chats — recipients\n/stats — counts and storage\n/id — your ID\n'
+        '/chats — recipients\n/stats — available counts\n/id — your ID\n'
+        '/buyers — saved buyers (excluded from broadcasts)\n/sales — recent purchases\n'
+        '/syncsales — import/reconcile bot purchase history\n'
+        '/customer ID — purchase history and notes\n/note ID TEXT — save a customer note\n'
+        '/hold ID — exclude a chat from broadcasts\n/release ID — remove manual hold (buyers stay excluded)\n'
         '/status — broadcast progress\n/stopbroadcast — stop remaining sends\n'
         'Recipients can send /stop to Jovanica to opt out, /start to resume.')
 
@@ -99,7 +103,11 @@ def deliver(content, cid, chat_id):
     validate_content(content)
     if content.get('kind') == 'text':
         return api('sendMessage', business_connection_id=cid, chat_id=chat_id, text=content['text'])
-    return api('sendPaidMedia', business_connection_id=cid, chat_id=chat_id,
+    payload = 'jm4:' + secrets.token_hex(16)
+    with DB:
+        DB.execute('INSERT INTO offers VALUES (?,?,?,?,?)',
+                   (payload, str(chat_id), content['price'], content.get('caption', ''), int(time.time())))
+    return api('sendPaidMedia', business_connection_id=cid, chat_id=chat_id, payload=payload,
                star_count=content['price'], media=media_items(content),
                caption=content.get('caption', ''), protect_content=True)
 
@@ -111,19 +119,156 @@ def initialize_database(path):
     existing = dbfile.exists()
     DB = sqlite3.connect(dbfile)
     if existing:
-        # One backup before the first v3 start, never overwrite an existing backup.
-        backup = path / 'manager-before-v3.sqlite3'
+        # One backup before the first v4 start, never overwrite an existing backup.
+        backup = path / 'manager-before-v4.sqlite3'
         if not backup.exists():
             with sqlite3.connect(backup) as dest:
                 DB.backup(dest)
     DB.execute('CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
     DB.commit()
-    # No drops, deletes or reset of contacts, offsets, jobs, or drafts.
+    DB.executescript("""
+        CREATE TABLE IF NOT EXISTS offers (
+            payload TEXT PRIMARY KEY, chat_id TEXT, price INTEGER, caption TEXT, created INTEGER);
+        CREATE TABLE IF NOT EXISTS purchases (
+            receipt TEXT PRIMARY KEY, user_id TEXT, name TEXT, username TEXT, payload TEXT, date INTEGER);
+        CREATE TABLE IF NOT EXISTS star_ledger (
+            txid TEXT, direction TEXT, user_id TEXT, name TEXT, username TEXT,
+            amount INTEGER, date INTEGER, payload TEXT,
+            PRIMARY KEY(txid, direction));
+        CREATE TABLE IF NOT EXISTS customer_notes (
+            user_id TEXT PRIMARY KEY, note TEXT NOT NULL DEFAULT '', held INTEGER NOT NULL DEFAULT 0);
+    """)
+    DB.commit()
+    # Contacts, offsets, drafts and jobs stay in the existing state table.
 
 
 def active(chat):
     return (chat.get('id') != OWNER and not chat.get('opted_out', False)
             and 0 <= time.time() - chat['date'] < 86340)
+
+def buyer_ids():
+    return {r[0] for r in DB.execute("SELECT user_id FROM purchases UNION SELECT user_id FROM star_ledger WHERE direction='in'")}
+
+def held_ids():
+    return {r[0] for r in DB.execute('SELECT user_id FROM customer_notes WHERE held=1')}
+
+def protected(key):
+    return str(key) in buyer_ids() | held_ids()
+
+def available_chats():
+    connections, available, unknown = {}, [], 0
+    for key, chat in get('chats', {}).items():
+        if not active(chat):
+            continue
+        cid = chat['connection']
+        if cid not in connections:
+            try:
+                connections[cid] = connection(cid)
+            except ValueError:
+                connections[cid] = {}
+            except APIError:
+                connections[cid] = None
+        c = connections[cid]
+        if c is None:
+            unknown += 1
+        elif c.get('rights', {}).get('can_reply'):
+            available.append(key)
+    return available, unknown
+
+def sales_ready():
+    return (bool(get('sales_complete', 0)) and time.time() - get('sales_complete', 0) < 120
+            and not get('sales_scan', {}).get('running'))
+
+def receipt(user, payload, date):
+    # One payload per sent PPV, one record per buyer; events and ledger sync deduplicate.
+    key = payload + ':' + str(user['id'])
+    with DB:
+        cursor = DB.execute('INSERT OR IGNORE INTO purchases VALUES (?,?,?,?,?,?)',
+            (key, str(user['id']), user.get('first_name', ''), user.get('username', ''), payload, date))
+    return bool(cursor.rowcount)
+
+def purchase_event(event):
+    payload, user = event['paid_media_payload'], event['from']
+    offer = DB.execute('SELECT price,caption FROM offers WHERE payload=?', (payload,)).fetchone()
+    if not offer:
+        return
+    if receipt(user, payload, int(time.time())):
+        tell(OWNER, 'PPV PURCHASE: ' + user.get('first_name', str(user['id'])) +
+             ' (' + str(user['id']) + ') — ' + str(offer[0]) + ' Stars\n' +
+             ('@' + user['username'] + '\n' if user.get('username') else '') +
+             'Offer: ' + offer[1][:300] + '\nSaved as buyer; excluded from mass sends.\n/customer ' + str(user['id']))
+
+def sync_sales_tick():
+    scan = get('sales_scan', {})
+    if not scan.get('running'):
+        if time.time() - get('sales_complete', 0) < 60:
+            return
+        scan = {'running': True, 'offset': 0, 'imported': 0}
+        put('sales_scan', scan)
+    if time.time() < scan.get('retry_at', 0):
+        return
+    try:
+        rows = api('getStarTransactions', offset=scan['offset'], limit=100)['transactions']
+    except APIError:
+        scan['retry_at'] = time.time() + 30
+        put('sales_scan', scan)
+        return
+    added = 0
+    # Store page and its cursor together so restarts cannot lose or duplicate records.
+    with DB:
+        for tx in rows:
+            direction = 'in' if tx.get('source') else 'out'
+            partner = tx.get('source') or tx.get('receiver', {})
+            if partner.get('type') != 'user' or partner.get('transaction_type') != 'paid_media_payment':
+                continue
+            user = partner['user']
+            payload = partner.get('paid_media_payload', '')
+            cur = DB.execute('INSERT OR IGNORE INTO star_ledger VALUES (?,?,?,?,?,?,?,?)',
+                (tx['id'], direction, str(user['id']), user.get('first_name', ''), user.get('username', ''),
+                 abs(tx['amount']), tx['date'], payload))
+            added += cur.rowcount
+            if direction == 'in' and payload:
+                DB.execute('INSERT OR IGNORE INTO purchases VALUES (?,?,?,?,?,?)',
+                    (payload + ':' + str(user['id']), str(user['id']), user.get('first_name', ''),
+                     user.get('username', ''), payload, tx['date']))
+        scan.update(offset=scan['offset'] + len(rows), imported=scan['imported'] + added)
+        complete = len(rows) < 100
+        if complete:
+            scan['running'] = False
+            DB.execute('INSERT OR REPLACE INTO state VALUES (?,?)', ('sales_complete', json.dumps(time.time())))
+        DB.execute('INSERT OR REPLACE INTO state VALUES (?,?)', ('sales_scan', json.dumps(scan)))
+    if complete and scan.get('notify'):
+        tell(OWNER, 'Sales sync complete. ' + str(scan['imported']) +
+             ' new transaction records; ' + str(len(buyer_ids())) + ' saved buyers. /buyers or /sales.')
+
+def identity(key):
+    row = DB.execute("SELECT name,username FROM star_ledger WHERE user_id=? ORDER BY date DESC LIMIT 1", (key,)).fetchone()
+    if not row:
+        row = DB.execute('SELECT name,username FROM purchases WHERE user_id=? ORDER BY date DESC LIMIT 1', (key,)).fetchone()
+    chat = get('chats', {}).get(key, {})
+    name, username = row if row else (chat.get('name', key), chat.get('username', ''))
+    return name + (' @' + username if username else '') + ' — ' + key
+
+def buyer_summary(key):
+    count, gross = DB.execute("SELECT COUNT(*),COALESCE(SUM(amount),0) FROM star_ledger WHERE user_id=? AND direction='in'", (key,)).fetchone()
+    refunds = DB.execute("SELECT COALESCE(SUM(amount),0) FROM star_ledger WHERE user_id=? AND direction='out'", (key,)).fetchone()[0]
+    return identity(key) + ' — ' + str(count) + ' synced purchases, ' + str(gross) + ' Stars received, ' + str(refunds) + ' refunded'
+
+def sales_report(key=None):
+    clause, args = (' WHERE user_id=?', (key,)) if key else ('', ())
+    rows = DB.execute('SELECT user_id,amount,date,payload,direction FROM star_ledger' + clause + ' ORDER BY date DESC LIMIT 20', args).fetchall()
+    lines = []
+    for uid, amount, date, payload, direction in rows:
+        offer = DB.execute('SELECT caption FROM offers WHERE payload=?', (payload,)).fetchone()
+        title = offer[0][:100] if offer and offer[0] else ('Tracked PPV' if offer else 'Older/unlabelled PPV')
+        lines.append(time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(date)) + ' | ' + identity(uid) +
+                     ' | ' + ('REFUND ' if direction == 'out' else '') + str(amount) + ' Stars | ' + title)
+    last = get('sales_complete', 0)
+    return ('Latest 20 synced transactions (received Stars, not withdrawable balance).\n' +
+            ('\n'.join(lines) or 'No synced PPV transactions yet.') +
+            '\nLast complete sync: ' + (time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(last)) if last else 'not yet complete') +
+            '\nPurchase alerts can appear before the transaction sync. /syncsales to refresh.')
+
 
 def summary(job):
     rows = job.get('recipients', [])
@@ -136,6 +281,9 @@ def summary(job):
 def broadcast_tick():
     job = get('job')
     if not job or job['state'] != 'running':
+        return
+    # Buyers and manual holds are always excluded, including from older queued jobs.
+    if not sales_ready():
         return
     # Any leftover sending state has an uncertain outcome after a crash/error.
     for r in job['recipients']:
@@ -151,7 +299,7 @@ def broadcast_tick():
         tell(OWNER, summary(job))
         return
     chat = get('chats', {}).get(row['key'])
-    if not chat or not active(chat) or chat['connection'] != row['connection']:
+    if not chat or not active(chat) or protected(row['key']) or chat['connection'] != row['connection']:
         row['state'] = 'skipped'
         put('job', job)
         return
@@ -177,6 +325,9 @@ def broadcast_tick():
 
 
 def handle(u):
+    if 'purchased_paid_media' in u:
+        purchase_event(u['purchased_paid_media'])
+        return
     if 'business_connection' in u:
         c = u['business_connection']
         if c.get('user', {}).get('id') == OWNER:
@@ -191,7 +342,7 @@ def handle(u):
         chats = get('chats', {})
         key = str(m['chat']['id'])
         chats[key] = {'id': m['chat']['id'], 'name': m['chat'].get('first_name', key),
-                      'date': m['date'], 'connection': cid,
+                      'date': m['date'], 'connection': cid, 'username': m['chat'].get('username', ''),
                       'opted_out': chats.get(key, {}).get('opted_out', False)}
         command = m.get('text', '').strip().lower()
         if command == '/stop':
@@ -223,9 +374,53 @@ def process(uid, m, text):
         tell(uid, HELP)
     elif text == '/stats':
         chats = get('chats', {})
-        path = os.environ.get('DATA_DIR', '/data')
-        mount = os.environ.get('RAILWAY_VOLUME_MOUNT_PATH', 'Not reported; check Railway volume settings')
-        tell(uid, 'Recorded chats: ' + str(len(chats)) + '\nEligible now: ' + str(sum(active(c) for c in chats.values())) + '\nDatabase: ' + path + '/manager.sqlite3\nRailway volume mount: ' + mount + '\nExpired chats stay recorded. Telegram contacts are separate.')
+        ready, unknown = available_chats()
+        buyers, held = buyer_ids(), held_ids()
+        bulk = [k for k in ready if k not in buyers | held]
+        tell(uid, 'Recorded chats: ' + str(len(chats)) +
+             '\nWithin reply window + reply permission: ' + str(len(ready)) +
+             '\nKnown buyers (all time): ' + str(len(buyers)) +
+             '\nBuyers available for individual follow-up: ' + str(sum(k in buyers for k in ready)) +
+             '\nManual holds (all time): ' + str(len(held)) +
+             '\nMass-send candidates, excluding buyers/holds: ' + str(len(bulk)) +
+             '\nPermission checks unavailable: ' + str(unknown) +
+             '\nSales sync: ' + ('current' if sales_ready() else 'pending/stale — broadcasts wait for sync') +
+             '\nCounts are a snapshot, not a delivery guarantee. Expired chats remain saved. Telegram contacts are separate.')
+    elif text == '/syncsales':
+        scan = get('sales_scan', {})
+        if scan.get('running'):
+            scan['notify'] = True
+        else:
+            scan = {'running': True, 'offset': 0, 'imported': 0, 'notify': True}
+        put('sales_scan', scan)
+        tell(uid, 'Importing this bot’s PPV transaction history. Contacts stay saved. I will report when complete.')
+    elif text == '/buyers':
+        keys = sorted(buyer_ids())
+        tell(uid, 'Saved buyers: ' + str(len(keys)) + ' — excluded from ALL broadcasts.\n' +
+             ('\n'.join(buyer_summary(k) for k in keys) or 'None recorded yet. /syncsales imports earlier purchases.') +
+             '\n/customer ID for notes and purchases. Pin the chat manually in your personal Telegram inbox.')
+    elif text == '/sales':
+        tell(uid, sales_report())
+    elif text.startswith('/customer '):
+        key = str(int(text.split()[1]))
+        row = DB.execute('SELECT note,held FROM customer_notes WHERE user_id=?', (key,)).fetchone()
+        tell(uid, buyer_summary(key) + '\nBuyer: ' + str(key in buyer_ids()) +
+             '\nManual hold: ' + str(bool(row and row[1])) + '\nNote: ' + (row[0] if row else '') +
+             '\n' + sales_report(key))
+    elif text.startswith('/note ') or text.startswith('/hold ') or text.startswith('/release '):
+        parts = text.split(maxsplit=2)
+        key = str(int(parts[1]))
+        if key not in get('chats', {}) and key not in buyer_ids():
+            raise ValueError('Use an ID from /chats or /buyers.')
+        with DB:
+            DB.execute('INSERT OR IGNORE INTO customer_notes(user_id) VALUES (?)', (key,))
+            if parts[0] == '/note':
+                if len(parts) < 3:
+                    raise ValueError('Use /note ID TEXT.')
+                DB.execute('UPDATE customer_notes SET note=? WHERE user_id=?', (parts[2][:2000], key))
+            else:
+                DB.execute('UPDATE customer_notes SET held=? WHERE user_id=?', (int(parts[0] == '/hold'), key))
+        tell(uid, 'Saved for ' + identity(key) + '. Buyers remain excluded from broadcasts; /send still supports individual follow-up.')
     elif text == '/draft':
         tell(uid, content_description(draft) + ('\nBundle OPEN — /done when finished.' if draft.get('collecting') else ''))
     elif text == '/newppv':
@@ -253,7 +448,7 @@ def process(uid, m, text):
     elif text == '/chats':
         chats = get('chats', {})
         lines = [str(c['id']) + ' — ' + c['name'] + (' — opted out' if c.get('opted_out') else ' — active' if active(c) else ' — expired') for c in chats.values()]
-        tell(uid, '\n'.join(lines)[-3900:] or 'No chats recorded. Now send Hi from your second account to Jovanica.')
+        tell(uid, '\n'.join(lines) or 'No chats recorded. Now send Hi from your second account to Jovanica.')
     elif text.startswith('/target '):
         key = str(int(text.split()[1]))
         if key not in get('chats', {}):
@@ -334,6 +529,8 @@ def process(uid, m, text):
         put('job', job)
         tell(uid, summary(job) + '\nAlready sent posts remain in recipient chats.')
     elif text == '/broadcast':
+        if not sales_ready():
+            raise ValueError('Buyer history is syncing or stale. Wait a moment, then /broadcast again. /syncsales to request a sync report.')
         if get('job', {}).get('state') == 'running':
             raise ValueError('A broadcast is running. Use /status or /stopbroadcast.')
         validate_content(draft)
@@ -341,7 +538,7 @@ def process(uid, m, text):
         connections = {}
         chats = get('chats', {})
         for key, chat in chats.items():
-            if not active(chat):
+            if not active(chat) or protected(key):
                 continue
             cid = chat['connection']
             if cid not in connections:
@@ -357,7 +554,7 @@ def process(uid, m, text):
         put('draft', draft)
         tell(uid, 'BROADCAST FROM JOVANICA\nRecipients: ' + str(len(candidates)) +
              ' of ' + str(len(chats)) + ' recorded chats\n' + content_description(draft) +
-             '\n\nThis ignores /target and sends to ALL eligible chats in this frozen list.' +
+             '\n\nThis ignores /target and sends only to eligible NON-BUYERS without a manual hold in this frozen list.' +
              '\nExpired/unavailable chats will be skipped or rejected.' +
              '\nConfirm within 5 minutes: /confirm ' + draft['confirm'] + '\nOr /cancel.')
     elif text == '/cancel':
@@ -421,7 +618,7 @@ def main():
     while True:
         try:
             updates = api('getUpdates', offset=get('offset', 0), timeout=0 if get('job', {}).get('state') == 'running' else 25,
-                allowed_updates=['message', 'business_connection', 'business_message'])
+                allowed_updates=['message', 'business_connection', 'business_message', 'purchased_paid_media'])
             for update in updates:
                 # Persist before processing: failure cannot replay an outbound action.
                 put('offset', update['update_id'] + 1)
@@ -430,6 +627,7 @@ def main():
                 except Exception as exc:
                     print('Update failed (' + type(exc).__name__ + '); no automatic send retry.', flush=True)
             try:
+                sync_sales_tick()
                 broadcast_tick()
             except Exception as exc:
                 print('Broadcast step failed (' + type(exc).__name__ + '); check /status.', flush=True)
