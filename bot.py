@@ -1,5 +1,6 @@
 """Single-owner paid-media manager with durable broadcasts. Python standard library only."""
 import json
+import re
 import os
 import secrets
 import sqlite3
@@ -58,13 +59,18 @@ def eligible(c, chat):
     if not 0 <= time.time() - chat['date'] < 86400 - 60:
         raise ValueError('Reply window expired. The recipient must message Jovanica again.')
 
-HELP = ('Jovanica Manager v4 — buyers + broadcasts\n'
+HELP = ('Jovanica Manager v5 — saved packs + new audiences\n'
         '/newppv — start a fresh photo/video bundle\n'
         'Upload an album or individual photos/videos (max 10), then /done.\n'
         '/caption TEXT — set bundle caption\n/price NUMBER — 1–25000 Stars for the WHOLE bundle\n'
         '/text MESSAGE — create a FREE text-only message\n'
         '/target NUMBER — choose one recipient\n/send — review single send\n'
         '/broadcast — review all eligible recipients\n/confirm CODE — approve\n'
+        '/saveoffer NAME — save a NEW pack; existing chats may receive it\n'
+        '/savearchive NAME — recycle a pack for FUTURE new contacts only\n'
+        '/offers — list saved packs\n/offer NAME — load a pack for reuse\n'
+        '/audience all|6|12|24 — unsent contacts, optionally recent arrivals\n'
+        '/offerstatus — delivery history for loaded pack\n'
         '/draft — inspect content and item count\n/cancel — discard draft\n'
         '/chats — recipients\n/stats — available counts\n/id — your ID\n'
         '/buyers — saved buyers (excluded from broadcasts)\n/sales — recent purchases\n'
@@ -99,17 +105,54 @@ def content_description(content):
             'Price: ' + str(content.get('price', 'NOT SET')) +
             ' Stars to unlock the WHOLE bundle per recipient\nCaption: ' + content.get('caption', ''))
 
+def offer_blocked(content, key):
+    name = content.get('saved_offer')
+    if not name:
+        return False
+    row = DB.execute('SELECT status FROM offer_delivery WHERE name=? AND chat_id=?', (name, str(key))).fetchone()
+    return bool(row and row[0] != 'failed')
+
+def audience_matches(content, key):
+    hours = content.get('audience_hours', 0)
+    if not hours:
+        return True
+    row = DB.execute('SELECT first_seen FROM arrivals WHERE chat_id=?', (str(key),)).fetchone()
+    return bool(row and row[0] is not None and 0 <= time.time() - row[0] <= hours * 3600)
+
+def delivery_status(content, key, status, message_id=None):
+    if content.get('saved_offer'):
+        with DB:
+            DB.execute('INSERT OR REPLACE INTO offer_delivery VALUES (?,?,?,?,?)',
+                (content['saved_offer'], str(key), status, int(time.time()), message_id))
+
 def deliver(content, cid, chat_id):
     validate_content(content)
-    if content.get('kind') == 'text':
-        return api('sendMessage', business_connection_id=cid, chat_id=chat_id, text=content['text'])
-    payload = 'jm4:' + secrets.token_hex(16)
+    if offer_blocked(content, chat_id):
+        raise ValueError('This saved offer is already sent, excluded, or uncertain for this recipient. No duplicate sent.')
+    payload = 'jm5:' + secrets.token_hex(16)
+    # Persist tracking BEFORE contacting Telegram. A crash leaves a blocked sending record.
     with DB:
-        DB.execute('INSERT INTO offers VALUES (?,?,?,?,?)',
-                   (payload, str(chat_id), content['price'], content.get('caption', ''), int(time.time())))
-    return api('sendPaidMedia', business_connection_id=cid, chat_id=chat_id, payload=payload,
-               star_count=content['price'], media=media_items(content),
-               caption=content.get('caption', ''), protect_content=True)
+        if content.get('saved_offer'):
+            DB.execute('INSERT OR REPLACE INTO offer_delivery VALUES (?,?,?,?,NULL)',
+                (content['saved_offer'], str(chat_id), 'sending', int(time.time())))
+        if content.get('kind') != 'text':
+            DB.execute('INSERT INTO offers VALUES (?,?,?,?,?)',
+                (payload, str(chat_id), content['price'], content.get('caption', ''), int(time.time())))
+            if content.get('saved_offer'):
+                DB.execute('INSERT INTO offer_links VALUES (?,?)', (payload, content['saved_offer']))
+    try:
+        if content.get('kind') == 'text':
+            result = api('sendMessage', business_connection_id=cid, chat_id=chat_id, text=content['text'])
+        else:
+            result = api('sendPaidMedia', business_connection_id=cid, chat_id=chat_id, payload=payload,
+                         star_count=content['price'], media=media_items(content),
+                         caption=content.get('caption', ''), protect_content=True)
+    except APIError as exc:
+        delivery_status(content, chat_id, 'failed' if exc.definite else 'uncertain')
+        raise
+    delivery_status(content, chat_id, 'sent', result['message_id'])
+    return result
+
 
 def initialize_database(path):
     global DB
@@ -119,14 +162,21 @@ def initialize_database(path):
     existing = dbfile.exists()
     DB = sqlite3.connect(dbfile)
     if existing:
-        # One backup before the first v4 start, never overwrite an existing backup.
-        backup = path / 'manager-before-v4.sqlite3'
+        # One backup before the first v5 start, never overwrite an existing backup.
+        backup = path / 'manager-before-v5.sqlite3'
         if not backup.exists():
             with sqlite3.connect(backup) as dest:
                 DB.backup(dest)
     DB.execute('CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
     DB.commit()
     DB.executescript("""
+        CREATE TABLE IF NOT EXISTS saved_offers (
+            name TEXT PRIMARY KEY, content TEXT NOT NULL, created INTEGER, archive INTEGER);
+        CREATE TABLE IF NOT EXISTS offer_delivery (
+            name TEXT, chat_id TEXT, status TEXT, updated INTEGER, message_id INTEGER,
+            PRIMARY KEY(name,chat_id));
+        CREATE TABLE IF NOT EXISTS offer_links (payload TEXT PRIMARY KEY, name TEXT);
+        CREATE TABLE IF NOT EXISTS arrivals (chat_id TEXT PRIMARY KEY, first_seen INTEGER);
         CREATE TABLE IF NOT EXISTS offers (
             payload TEXT PRIMARY KEY, chat_id TEXT, price INTEGER, caption TEXT, created INTEGER);
         CREATE TABLE IF NOT EXISTS purchases (
@@ -139,6 +189,10 @@ def initialize_database(path):
             user_id TEXT PRIMARY KEY, note TEXT NOT NULL DEFAULT '', held INTEGER NOT NULL DEFAULT 0);
     """)
     DB.commit()
+    # Existing chat arrival times are unknown; never invent a recent arrival date.
+    with DB:
+        DB.executemany('INSERT OR IGNORE INTO arrivals VALUES (?,NULL)',
+                       [(key,) for key in get('chats', {})])
     # Contacts, offsets, drafts and jobs stay in the existing state table.
 
 
@@ -299,7 +353,8 @@ def broadcast_tick():
         tell(OWNER, summary(job))
         return
     chat = get('chats', {}).get(row['key'])
-    if not chat or not active(chat) or protected(row['key']) or chat['connection'] != row['connection']:
+    if (not chat or not active(chat) or protected(row['key']) or chat['connection'] != row['connection']
+            or offer_blocked(job, row['key']) or not audience_matches(job, row['key'])):
         row['state'] = 'skipped'
         put('job', job)
         return
@@ -341,6 +396,8 @@ def handle(u):
         connection(cid)
         chats = get('chats', {})
         key = str(m['chat']['id'])
+        with DB:
+            DB.execute('INSERT OR IGNORE INTO arrivals VALUES (?,?)', (key, m['date']))
         chats[key] = {'id': m['chat']['id'], 'name': m['chat'].get('first_name', key),
                       'date': m['date'], 'connection': cid, 'username': m['chat'].get('username', ''),
                       'opted_out': chats.get(key, {}).get('opted_out', False)}
@@ -368,8 +425,89 @@ def handle(u):
     except (ValueError, KeyError) as exc:
         tell(uid, str(exc))
 
+def offer_description(content):
+    if not content.get('saved_offer'):
+        return ''
+    hours = content.get('audience_hours', 0)
+    return ('Saved pack: ' + content['saved_offer'] +
+            '\nAudience: not previously sent/excluded/uncertain for this pack' +
+            ('; first seen within ' + str(hours) + ' hours' if hours else '; any arrival time') +
+            '\nBuyers, holds and opted-out/expired chats remain excluded from broadcasts.\n')
+
+def offer_command(uid, draft, text):
+    command, _, argument = text.partition(' ')
+    if command not in ('/saveoffer', '/savearchive', '/offers', '/offer', '/audience', '/offerstatus'):
+        return False
+    if command in ('/saveoffer', '/savearchive', '/offer'):
+        name = argument.strip().lower()
+        if not re.fullmatch(r'[a-z0-9_-]{1,40}', name):
+            raise ValueError('Use a short name with letters/numbers/underscores, e.g. welcome.')
+    if command in ('/saveoffer', '/savearchive'):
+        validate_content(draft)
+        if draft.get('saved_offer'):
+            raise ValueError('Already a saved pack. Use /offer NAME to reuse it. /newppv starts different content.')
+        if DB.execute('SELECT 1 FROM saved_offers WHERE name=?', (name,)).fetchone():
+            raise ValueError('That name already exists. Use /offer ' + name + ' to reuse its delivery history.')
+        content = {k: draft[k] for k in ('kind', 'media', 'caption', 'price', 'text') if k in draft}
+        archive = command == '/savearchive'
+        with DB:
+            DB.execute('INSERT INTO saved_offers VALUES (?,?,?,?)',
+                       (name, json.dumps(content), int(time.time()), int(archive)))
+            if archive:
+                DB.executemany('INSERT INTO offer_delivery VALUES (?,?,?,?,NULL)',
+                    [(name, key, 'excluded', int(time.time())) for key in get('chats', {})])
+            loaded = dict(content, saved_offer=name, audience_hours=0)
+            DB.execute('INSERT OR REPLACE INTO state VALUES (?,?)', ('draft', json.dumps(loaded)))
+        tell(uid, 'Saved and loaded: ' + name + '. Nothing sent.\n' +
+             ('Existing ' + str(len(get('chats', {}))) + ' chats excluded for this pack. Future newcomers can receive it.' if archive else
+              'Existing contacts may receive this pack. Earlier untracked deliveries cannot be detected; use this mode for new content.') +
+             '\n/broadcast to preview. Later: /offer ' + name + ' then /broadcast. Do not re-save the same pack under new names.')
+    elif command == '/offers':
+        rows = DB.execute('SELECT name,content,archive FROM saved_offers ORDER BY created,name').fetchall()
+        lines = []
+        for name, raw, archive in rows:
+            content = json.loads(raw)
+            sent = DB.execute("SELECT COUNT(*) FROM offer_delivery WHERE name=? AND status='sent'", (name,)).fetchone()[0]
+            lines.append(name + ' — ' + ('free text' if content.get('kind') == 'text' else str(content.get('price')) + ' Stars') +
+                         ' — ' + str(sent) + ' delivered' + (' — old audience excluded' if archive else ''))
+        tell(uid, '\n'.join(lines) or 'No saved packs. Prepare content, then /saveoffer NAME (new content) or /savearchive NAME (recycled content).')
+    elif command == '/offer':
+        row = DB.execute('SELECT content FROM saved_offers WHERE name=?', (name,)).fetchone()
+        if not row:
+            raise ValueError('Unknown pack. /offers lists saved names.')
+        loaded = dict(json.loads(row[0]), saved_offer=name, audience_hours=0)
+        put('draft', loaded)
+        tell(uid, offer_description(loaded) + content_description(loaded) + '\n/broadcast to preview. Nothing sent.')
+    elif command == '/audience':
+        if not draft.get('saved_offer'):
+            raise ValueError('Load a pack first: /offer NAME.')
+        if argument.strip() not in ('all', '6', '12', '24'):
+            raise ValueError('Use /audience all, /audience 6, /audience 12, or /audience 24.')
+        draft['audience_hours'] = 0 if argument.strip() == 'all' else int(argument)
+        draft.pop('confirm', None)
+        put('draft', draft)
+        tell(uid, offer_description(draft) +
+             'Arrival times are recorded from v5 onward; older contacts with unknown arrival times are omitted from hourly filters.\n/broadcast to preview.')
+    else:
+        name = draft.get('saved_offer')
+        if not name:
+            raise ValueError('Load a pack first: /offer NAME.')
+        rows = DB.execute('SELECT status,COUNT(*) FROM offer_delivery WHERE name=? GROUP BY status', (name,)).fetchall()
+        keys, unknown = available_chats()
+        excluded = buyer_ids() | held_ids()
+        count = sum(k not in excluded and not offer_blocked(draft,k) and audience_matches(draft,k) for k in keys)
+        buyers = DB.execute("SELECT COUNT(DISTINCT p.user_id) FROM purchases p JOIN offer_links l ON l.payload=p.payload WHERE l.name=?", (name,)).fetchone()[0]
+        tell(uid, offer_description(draft) + '\n'.join(status + ': ' + str(n) for status,n in rows) +
+             '\nKnown buyers of this pack: ' + str(buyers) + '\nMatching recipients now: ' + str(count) +
+             '\nUnavailable permission checks: ' + str(unknown) +
+             '\nSending/uncertain records stay excluded to avoid duplicates. Failed deliveries can be included in a later confirmed run.')
+    return True
+
+
 def process(uid, m, text):
     draft = get('draft', {})
+    if offer_command(uid, draft, text):
+        return
     if text in ('/start', '/help'):
         tell(uid, HELP)
     elif text == '/stats':
@@ -422,7 +560,7 @@ def process(uid, m, text):
                 DB.execute('UPDATE customer_notes SET held=? WHERE user_id=?', (int(parts[0] == '/hold'), key))
         tell(uid, 'Saved for ' + identity(key) + '. Buyers remain excluded from broadcasts; /send still supports individual follow-up.')
     elif text == '/draft':
-        tell(uid, content_description(draft) + ('\nBundle OPEN — /done when finished.' if draft.get('collecting') else ''))
+        tell(uid, offer_description(draft) + content_description(draft) + ('\nBundle OPEN — /done when finished.' if draft.get('collecting') else ''))
     elif text == '/newppv':
         fresh = {'kind': 'ppv', 'media': [], 'caption': '', 'collecting': True}
         if 'target' in draft:
@@ -456,8 +594,10 @@ def process(uid, m, text):
         draft['target'] = key
         draft.pop('confirm', None)
         put('draft', draft)
-        tell(uid, 'Recipient selected. Send one photo/video here, then /price 1.')
+        tell(uid, 'Recipient selected. Prepare your content if needed, then /send to review.')
     elif m.get('photo') or m.get('video'):
+        if draft.get('saved_offer'):
+            raise ValueError('Saved packs keep their media. Use /newppv to create a different pack.')
         item = {'type': 'photo', 'media': m['photo'][-1]['file_id']} if m.get('photo') else {'type': 'video', 'media': m['video']['file_id']}
         group = m.get('media_group_id')
         same_group = bool(group and group == draft.get('album_group'))
@@ -538,7 +678,8 @@ def process(uid, m, text):
         connections = {}
         chats = get('chats', {})
         for key, chat in chats.items():
-            if not active(chat) or protected(key):
+            if (not active(chat) or protected(key) or offer_blocked(draft, key)
+                    or not audience_matches(draft, key)):
                 continue
             cid = chat['connection']
             if cid not in connections:
@@ -549,11 +690,11 @@ def process(uid, m, text):
             if connections[cid].get('rights', {}).get('can_reply'):
                 candidates.append({'key': key, 'connection': cid, 'state': 'pending'})
         if not candidates:
-            raise ValueError('No eligible chats. Have your test account send Hi to Jovanica again.')
+            raise ValueError('No recipients match: reply window, buyer/hold exclusions, and any saved-pack/history/arrival filters. Nothing sent.')
         draft.update(mode='broadcast', recipients=candidates, confirm=secrets.token_hex(3), expires=time.time()+300)
         put('draft', draft)
         tell(uid, 'BROADCAST FROM JOVANICA\nRecipients: ' + str(len(candidates)) +
-             ' of ' + str(len(chats)) + ' recorded chats\n' + content_description(draft) +
+             ' of ' + str(len(chats)) + ' recorded chats\n' + offer_description(draft) + content_description(draft) +
              '\n\nThis ignores /target and sends only to eligible NON-BUYERS without a manual hold in this frozen list.' +
              '\nExpired/unavailable chats will be skipped or rejected.' +
              '\nConfirm within 5 minutes: /confirm ' + draft['confirm'] + '\nOr /cancel.')
@@ -565,6 +706,8 @@ def process(uid, m, text):
         if 'target' not in draft:
             raise ValueError('Choose /target NUMBER first.')
         chat = get('chats', {})[draft['target']]
+        if offer_blocked(draft, draft['target']):
+            raise ValueError('This saved pack is already sent, excluded, or uncertain for this person. Nothing sent.')
         eligible(connection(chat['connection']), chat)
         code = secrets.token_hex(3)
         draft['mode'] = 'single'
@@ -572,7 +715,7 @@ def process(uid, m, text):
         draft['expires'] = time.time() + 300
         put('draft', draft)
         tell(uid, 'SEND FROM JOVANICA\nTo: ' + chat['name'] + ' (' + str(chat['id']) + ')\n' +
-             content_description(draft) + '\n\nSend /confirm ' + code + ' within 5 minutes, or /cancel.')
+             offer_description(draft) + content_description(draft) + '\n\nSend /confirm ' + code + ' within 5 minutes, or /cancel.')
     elif text.startswith('/confirm '):
         if text.split()[1] != draft.get('confirm') or time.time() > draft.get('expires', 0):
             raise ValueError('Invalid/expired confirmation. Run /send or /broadcast again.')
@@ -580,7 +723,7 @@ def process(uid, m, text):
         if draft.get('mode') == 'broadcast':
             if get('job', {}).get('state') == 'running':
                 raise ValueError('A broadcast is already running.')
-            job = {k: draft[k] for k in ('media', 'price', 'recipients', 'kind', 'text') if k in draft}
+            job = {k: draft[k] for k in ('media', 'price', 'recipients', 'kind', 'text', 'saved_offer', 'audience_hours') if k in draft}
             job.update(id=secrets.token_hex(4), state='running', caption=draft.get('caption', ''), next_at=0)
             # Atomic job creation and confirmation consumption.
             with DB:
@@ -589,6 +732,8 @@ def process(uid, m, text):
             tell(uid, 'Broadcast queued for ' + str(len(job['recipients'])) + ' chats. /status for progress; /stopbroadcast to stop remaining sends.')
             return
         chat = get('chats', {})[draft['target']]
+        if offer_blocked(draft, draft['target']):
+            raise ValueError('This saved pack is already sent, excluded, or uncertain for this person. Nothing sent.')
         eligible(connection(chat['connection']), chat)
         if chat.get('opted_out'):
             raise ValueError('This recipient opted out.')
