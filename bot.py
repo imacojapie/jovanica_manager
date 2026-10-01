@@ -12,11 +12,14 @@ from pathlib import Path
 TOKEN = os.environ.get('BOT_TOKEN', '')
 OWNER = int(os.environ.get('OWNER_ID', '0'))
 DB = None
+BROADCAST_INTERVAL = 0.34
+CONNECTION_CACHE = {}
 
 class APIError(Exception):
-    def __init__(self, message, definite=False):
+    def __init__(self, message, definite=False, retry_after=0):
         super().__init__(message)
         self.definite = definite
+        self.retry_after = retry_after
 
 def api(method, **data):
     request = urllib.request.Request('https://api.telegram.org/bot' + TOKEN + '/' + method,
@@ -26,11 +29,19 @@ def api(method, **data):
             result = json.load(response)
     except urllib.error.HTTPError as exc:
         # Do not log exception URLs: they contain the token.
-        raise APIError('Telegram HTTP ' + str(exc.code), definite=400 <= exc.code < 500) from None
+        retry_after = 0
+        try:
+            body = json.load(exc)
+            retry_after = max(0, int(body.get('parameters', {}).get('retry_after', 0)))
+        except (ValueError, TypeError, AttributeError):
+            pass
+        raise APIError('Telegram HTTP ' + str(exc.code), definite=400 <= exc.code < 500,
+                       retry_after=retry_after) from None
     except (urllib.error.URLError, TimeoutError):
         raise APIError('Network error; delivery may be uncertain') from None
     if not result.get('ok'):
-        raise APIError('Telegram rejected request', definite=True)
+        raise APIError('Telegram rejected request', definite=True,
+                       retry_after=max(0, int(result.get('parameters', {}).get('retry_after', 0))))
     return result['result']
 
 def get(key, default=None):
@@ -53,13 +64,22 @@ def connection(cid):
         raise ValueError('Connection is disabled or OWNER_ID is not the connected profile.')
     return c
 
+def broadcast_connection(cid):
+    cached = CONNECTION_CACHE.get(cid)
+    if cached and time.monotonic() - cached[0] < 10:
+        return cached[1]
+    result = connection(cid)
+    CONNECTION_CACHE[cid] = (time.monotonic(), result)
+    return result
+
+
 def eligible(c, chat):
     if not c.get('rights', {}).get('can_reply'):
         raise ValueError('Enable reply permission for this bot in Chat Automation.')
     if not 0 <= time.time() - chat['date'] < 86400 - 60:
         raise ValueError('Reply window expired. The recipient must message Jovanica again.')
 
-HELP = ('Jovanica Manager v5 — saved packs + new audiences\n'
+HELP = ('Jovanica Manager v6 — faster broadcasts + saved packs\n'
         '/newppv — start a fresh photo/video bundle\n'
         'Upload an album or individual photos/videos (max 10), then /done.\n'
         '/caption TEXT — set bundle caption\n/price NUMBER — 1–25000 Stars for the WHOLE bundle\n'
@@ -162,8 +182,8 @@ def initialize_database(path):
     existing = dbfile.exists()
     DB = sqlite3.connect(dbfile)
     if existing:
-        # One backup before the first v5 start, never overwrite an existing backup.
-        backup = path / 'manager-before-v5.sqlite3'
+        # One backup before the first v6 start, never overwrite an existing backup.
+        backup = path / 'manager-before-v6.sqlite3'
         if not backup.exists():
             with sqlite3.connect(backup) as dest:
                 DB.backup(dest)
@@ -359,14 +379,14 @@ def broadcast_tick():
         put('job', job)
         return
     try:
-        eligible(connection(chat['connection']), chat)
+        eligible(broadcast_connection(chat['connection']), chat)
     except ValueError:
         row['state'] = 'skipped'
         put('job', job)
         return
     # Commit before the side effect. On restart this becomes uncertain, never resent.
     row['state'] = 'sending'
-    job['next_at'] = time.time() + 1.1
+    job['next_at'] = time.time() + BROADCAST_INTERVAL
     put('job', job)
     try:
         result = deliver(job, row['connection'], chat['id'])
@@ -375,7 +395,8 @@ def broadcast_tick():
     except APIError as exc:
         row['state'] = 'failed' if exc.definite else 'uncertain'
         # No automatic retry. Slow down after errors, including rate limiting.
-        job['next_at'] = time.time() + 30
+        job['next_at'] = time.time() + max(30, exc.retry_after + 1)
+        CONNECTION_CACHE.pop(row['connection'], None)
     put('job', job)
 
 
@@ -385,6 +406,7 @@ def handle(u):
         return
     if 'business_connection' in u:
         c = u['business_connection']
+        CONNECTION_CACHE.pop(c['id'], None)
         if c.get('user', {}).get('id') == OWNER:
             put('connection', c['id'])
         return
@@ -751,6 +773,24 @@ def process(uid, m, text):
     else:
         tell(uid, HELP)
 
+def broadcast_batch():
+    # Short bounded bursts avoid one getUpdates round trip per recipient.
+    # Poll again between bursts for stop commands, new messages and purchases.
+    deadline = time.monotonic() + 2
+    for _ in range(6):
+        job = get('job', {})
+        if job.get('state') != 'running' or not sales_ready():
+            return
+        delay = max(0, job.get('next_at', 0) - time.time())
+        if delay > 0.5 or time.monotonic() + delay >= deadline:
+            return
+        if delay:
+            time.sleep(delay)
+        broadcast_tick()
+        if time.monotonic() >= deadline:
+            return
+
+
 def main():
     global DB
     if not TOKEN:
@@ -773,12 +813,12 @@ def main():
                     print('Update failed (' + type(exc).__name__ + '); no automatic send retry.', flush=True)
             try:
                 sync_sales_tick()
-                broadcast_tick()
+                broadcast_batch()
             except Exception as exc:
                 print('Broadcast step failed (' + type(exc).__name__ + '); check /status.', flush=True)
                 time.sleep(3)
             if get('job', {}).get('state') == 'running':
-                time.sleep(1.1)
+                time.sleep(0.1)
         except APIError:
             print('Telegram polling unavailable; retrying.', flush=True)
             time.sleep(5)
