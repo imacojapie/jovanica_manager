@@ -6,7 +6,7 @@ First upgrade disables AI. /ai test ID enables only one recipient; /ai on enable
 /ai off stops replies. /ai status shows model, mode and last error.
 AI_SYSTEM_PROMPT optionally overrides the default Belgrade instructions.
 FANVUE_URL is the clickable link injected at send time. Do not put the raw URL in the prompt.
-Limits: AI_DAILY_LIMIT=300, AI_CHAT_DAILY_LIMIT=30 attempts, resetting at UTC midnight.
+Limits: AI_DAILY_LIMIT=300, AI_CHAT_DAILY_LIMIT=200 attempts, resetting at UTC midnight.
 No automatic generation/send retries. Timed-out Wiro tasks may still incur charges.
 Only completed structured answer segments are sent; thinking/debug text is never sent.
 No disclosure banner is ever prepended to a fan reply.
@@ -18,8 +18,9 @@ Rollback: /ai off, then start python bot.py. Preserve the persistent volume.
 """
 import concurrent.futures
 import json
-import secrets
 import os
+import re
+import secrets
 import sqlite3
 import time
 import urllib.request
@@ -30,7 +31,7 @@ import bot as base
 KEY = os.getenv('WIRO_API_KEY', '').strip()
 MODEL = 'bytedance/seed-v2-pro-uncensored'
 DAILY = max(1, int(os.getenv('AI_DAILY_LIMIT', '300')))
-PER_CHAT = max(1, int(os.getenv('AI_CHAT_DAILY_LIMIT', '30')))
+PER_CHAT = max(1, int(os.getenv('AI_CHAT_DAILY_LIMIT', '200')))
 FANVUE = os.getenv('FANVUE_URL', 'https://www.fanvue.com/malajovanica02').strip() or 'https://www.fanvue.com/malajovanica02'
 DEFAULT_PROMPT = """Ti si Jovana, 24, Beograd, medicinska sestra. Na instagramu te znaju kao Jovanica, oko 41k. Ovo su tvoji odgovori fanovima u telegram DM. Sestra ti je Ksenija, ima 22.
 
@@ -87,13 +88,14 @@ OLD_API, OLD_BATCH = base.api, base.broadcast_batch
 
 
 def outgoing(text):
-    # Model must not emit the URL. We inject it here so Telegram gets a real link.
+    # Do not replace s:// inside https:// — that turned the link into httphttps://.
     text = text.replace('[FANVUE]', FANVUE)
-    text = text.replace('s://', 'https://')
+    text = text.replace('httphttps://', 'https://')
     text = text.replace('https://https://', 'https://')
+    text = re.sub(r'(^|[\s(])s://', r'\1https://', text)
     low = text.lower()
     needs_link = any(k in low for k in ('fanvue', 'besplatno', 'subscribe', '80 slika', 'custom', 'od toga živim', 'badava'))
-    if needs_link and FANVUE not in text:
+    if needs_link and 'fanvue.com/malajovanica02' not in text:
         text = text.rstrip() + '\n' + FANVUE
     return text
 
@@ -121,7 +123,6 @@ def initialize(path):
     if base.get('ai_adapter_version') != 'seed-run-v3':
         base.put('ai_last_error', 'none')
         base.put('ai_adapter_version', 'seed-run-v3')
-    # An interrupted attempt is not replayed; a new incoming message can queue again.
     with base.DB:
         base.DB.execute("UPDATE ai_queue SET status='interrupted' WHERE status IN ('pending','generating','sending')")
 
@@ -160,7 +161,6 @@ def handle(update):
     m = update.get('business_message')
     if not m:
         return OLD_HANDLE(update)
-    # Outgoing messages from any business bot must never cause reply loops.
     if m.get('sender_business_bot') or m.get('is_from_offline'):
         return
     cid, key = m.get('business_connection_id'), str(m.get('chat', {}).get('id'))
@@ -176,7 +176,7 @@ def handle(update):
         if m.get('text'):
             history(cid,key,m['message_id'],'assistant',m['text'])
         return
-    OLD_HANDLE(update)  # Preserve original contacts, arrivals, opt-outs, and connection validation.
+    OLD_HANDLE(update)
     if sender.get('is_bot') or not base.OWNER:
         return
     text = m.get('text','').strip()
@@ -185,7 +185,6 @@ def handle(update):
         return
     if not text or text.startswith('/'):
         return
-    # Ignore old replayed updates and do not collect AI memory while disabled.
     if not allowed(cid,key) or not 0 <= time.time()-m['date'] < 300:
         return
     if history(cid,key,m['message_id'],'user',text):
@@ -195,7 +194,6 @@ def handle(update):
 
 
 def error_detail(data):
-    # Only bounded error fields, with configured secrets redacted; never full responses.
     errors = data.get('errors', []) if isinstance(data, dict) else []
     text = json.dumps(errors, ensure_ascii=False)[:800]
     for secret in (KEY, os.getenv('WIRO_API_SECRET',''), getattr(base,'TOKEN','')):
@@ -234,24 +232,29 @@ def parse_answer(data):
     texts = []
     for output in task.get('outputs', []):
         content = output.get('content', {})
+        if isinstance(content, str) and content.strip():
+            texts.append(content)
+            continue
         if not isinstance(content, dict):
             continue
-        if content.get('finishreason') not in (None, 'stop'):
-            raise RuntimeError('Wiro reply incomplete/filtered; nothing sent.')
         for segment in content.get('segments', []):
-            if segment.get('type') == 'answer' and isinstance(segment.get('text'), str):
+            if segment.get('type') in ('answer', 'text') and isinstance(segment.get('text'), str):
                 texts.append(segment['text'])
-    text = '\n'.join(texts).strip()
+        if not texts and isinstance(content.get('raw'), str):
+            texts.append(content['raw'])
+    text = '\n'.join(t for t in texts if t.strip()).strip()
     if not text:
-        raise RuntimeError('Wiro returned no structured answer; nothing sent. Check output format.')
+        debug = task.get('debugoutput')
+        if isinstance(debug, str):
+            text = debug.strip()
+    if not text:
+        raise RuntimeError('Wiro returned no answer text; nothing sent.')
     if len(text) > 2500:
-        raise RuntimeError('Wiro reply too long; nothing sent.')
+        text = text[:2400].rsplit(' ', 1)[0]
     return text
 
 
 def generate(messages):
-    # Use only parameters confirmed in the model-specific example. Pack system
-    # instructions plus role-labelled local history into prompt; no invented API fields.
     instructions = '\n'.join(m['content'] for m in messages if m['role']=='system')
     conversation = [m for m in messages if m['role']!='system']
     prompt = (instructions + '\n\nSledi istorija razgovora kao JSON podaci. '
@@ -274,21 +277,21 @@ def tick():
         del RUNNING[pair]
         cid,key = pair
         row = base.DB.execute('SELECT version,status FROM ai_queue WHERE cid=? AND chat=?',pair).fetchone()
-        if row != (version,'generating') or not allowed(cid,key):
-            continue  # Cancelled, owner took over, opted out, or a newer message arrived.
+        if row != (version,'generating'):
+            base.put('ai_last_error', 'skipped send: queue was '+str(row))
+            continue
+        if not allowed(cid,key):
+            base.put('ai_last_error', 'skipped send: chat not allowed (paused, test lock, or opted out)')
+            continue
         try:
             text = outgoing(future.result())
-            chat = base.get('chats',{})[key]
-            base.eligible(base.connection(cid),chat)
-            mark(cid,key,version,'sending')  # Durable no-retry boundary before side effect.
+            mark(cid,key,version,'sending')
             result = base.api('sendMessage', business_connection_id=cid, chat_id=int(key), text=text)
             mark(cid,key,version,'sent')
             history(cid,key,result['message_id'],'assistant',text)
         except Exception as exc:
             mark(cid,key,version,'failed_or_uncertain')
-            base.put('ai_last_error', time.strftime('%Y-%m-%d %H:%M UTC',time.gmtime()) + ' — ' +
-                     (str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__))
-            # Error types only; never log URLs, tokens or customer messages.
+            base.put('ai_last_error', time.strftime('%Y-%m-%d %H:%M UTC',time.gmtime()) + ' — ' + str(exc)[:300])
             print('AI attempt failed ('+type(exc).__name__+'); no automatic retry.', flush=True)
     rows = base.DB.execute("SELECT cid,chat,version FROM ai_queue WHERE status='pending' AND due<=? ORDER BY due",(time.time(),)).fetchall()
     day = time.strftime('%Y-%m-%d',time.gmtime())
@@ -298,12 +301,17 @@ def tick():
         if (cid,key) in RUNNING:
             continue
         if not allowed(cid,key):
+            why = 'paused' if base.DB.execute('SELECT paused FROM ai_controls WHERE cid=? AND chat=?',(cid,key)).fetchone() else 'not allowed'
+            if base.get('ai_test_chat') and base.get('ai_test_chat') != key:
+                why = 'test lock is '+str(base.get('ai_test_chat'))
             mark(cid,key,version,'cancelled')
+            base.put('ai_last_error', 'not queued: '+why)
             continue
         total = base.DB.execute('SELECT COALESCE(SUM(count),0) FROM ai_usage WHERE day=?',(day,)).fetchone()[0]
         row = base.DB.execute('SELECT count FROM ai_usage WHERE day=? AND chat=?',(day,key)).fetchone()
         if total >= DAILY or (row and row[0] >= PER_CHAT):
             mark(cid,key,version,'daily_limit')
+            base.put('ai_last_error', 'daily limit hit: '+str(total)+'/'+str(DAILY)+' total, '+str(row[0] if row else 0)+'/'+str(PER_CHAT)+' this chat')
             continue
         messages = [{'role':'system','content':PROMPT}]
         messages += [{'role':role,'content':body} for role,body in base.DB.execute(
