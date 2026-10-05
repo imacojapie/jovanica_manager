@@ -1,5 +1,5 @@
 """Seed Run API queue fix, v5. Standard library only. Keep bot.py beside this file.
-Four parallel chats; one active request per chat. Bursts wait 4s, at most 12s.
+One Wiro request at a time to match the current project concurrency limit. Bursts wait 4s, at most 12s.
 New messages do not invalidate active generations. Incoming business updates are
 journaled before connection checks. Unstarted work survives restarts; interrupted
 external requests are never automatically retried. Existing prompt, link behavior,
@@ -72,7 +72,7 @@ Vrati samo poruku za njega."""
 PROMPT = os.getenv('AI_SYSTEM_PROMPT', DEFAULT_PROMPT).strip() or DEFAULT_PROMPT
 PROMPT += ('\n\nTvrdo, i ako gornji tekst kaže drugačije: nikad ne reci da si AI, bot, model ili lik. '
            'Ne šalji uvod ni sistemsku poruku. Kad treba Fanvue, stavi [FANVUE] u novom redu. Ne kucaj https.')
-POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 RUNNING = {}
 OLD_INIT, OLD_HANDLE, OLD_PROCESS = base.initialize_database, base.handle, base.process
 OLD_API, OLD_BATCH = base.api, base.broadcast_batch
@@ -495,7 +495,7 @@ def tick():
         WHERE job IS NULL GROUP BY cid,chat ORDER BY MIN(seq)''').fetchall()
     day = time.strftime('%Y-%m-%d',time.gmtime())
     for cid,key,first,last in rows:
-        if len(RUNNING) >= 4:
+        if len(RUNNING) >= 1:
             break
         if (cid,key) in RUNNING or time.time() < min(last+4,first+12):
             continue
@@ -542,7 +542,7 @@ def queue_report(key=''):
     events = base.DB.execute('SELECT chat,status,detail FROM ai_q5_events'+where+' ORDER BY received LIMIT 12',args).fetchall()
     day = time.strftime('%Y-%m-%d',time.gmtime())
     used = base.DB.execute('SELECT COALESCE(SUM(count),0) FROM ai_usage WHERE day=?',(day,)).fetchone()[0]
-    return ('Queue fix v5 | workers: '+str(len(RUNNING))+'/4 | today: '+str(used)+'/'+str(DAILY)+' attempts\n'
+    return ('Queue fix v5 | workers: '+str(len(RUNNING))+'/1 | today: '+str(used)+'/'+str(DAILY)+' attempts\n'
         +'Waiting (up to 20 chats):\n'+('\n'.join(chat+': '+str(n)+' messages' for chat,n in waiting) or 'none')
         +'\nRecent attempts:\n'+('\n'.join(chat+': '+status+(' — '+detail if detail else '') for chat,status,detail in jobs) or 'none')
         +'\nIncoming checks:\n'+('\n'.join(chat+': '+status+(' — '+detail if detail else '') for chat,status,detail in events) or 'none'))
