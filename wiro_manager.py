@@ -120,9 +120,11 @@ def initialize(path):
     CREATE TABLE IF NOT EXISTS ai_usage (
         day TEXT, chat TEXT, count INTEGER, PRIMARY KEY(day,chat));
     ''')
-    if base.get('ai_adapter_version') != 'seed-run-v3':
+    if base.get('ai_adapter_version') != 'seed-run-v4':
         base.put('ai_last_error', 'none')
-        base.put('ai_adapter_version', 'seed-run-v3')
+        base.put('ai_adapter_version', 'seed-run-v4')
+        with base.DB:
+            base.DB.execute('UPDATE ai_controls SET paused=0')
     with base.DB:
         base.DB.execute("UPDATE ai_queue SET status='interrupted' WHERE status IN ('pending','generating','sending')")
 
@@ -169,10 +171,6 @@ def handle(update):
     sender = m.get('from', {})
     if sender.get('id') == base.OWNER:
         base.connection(cid)
-        with base.DB:
-            base.DB.execute('INSERT OR IGNORE INTO ai_controls(cid,chat) VALUES (?,?)', (cid,key))
-            base.DB.execute('UPDATE ai_controls SET paused=1 WHERE cid=? AND chat=?', (cid,key))
-        cancel(cid,key)
         if m.get('text'):
             history(cid,key,m['message_id'],'assistant',m['text'])
         return
@@ -327,19 +325,25 @@ HELP = '''Wiro AI controls (owner only):
 /ai test ID — enable only one test recipient
 /ai on | /ai off | /ai status
 /aipause ID — pause one chat
-/airesume ID — allow future incoming messages to get AI replies
+/airesume ID — resume one chat
+/airesumeall — resume every paused chat, no IDs
 /aiforget ID — clear AI memory and cancel the current reply
-Manual messages from your profile pause that chat until /airesume ID.
+Writing from her account does not pause the chat. AI keeps replying until the daily cap.
 AI replies are free text; existing paid-media commands still control PPV.'''
 
 
 def process(uid,m,text):
     command, _, arg = text.partition(' ')
-    if command not in ('/ai','/aimodels','/aipause','/airesume','/aiforget'):
+    if command not in ('/ai','/aimodels','/aipause','/airesume','/airesumeall','/aiforget'):
         return OLD_PROCESS(uid,m,text)
     if uid != base.OWNER:
         return
     arg = arg.strip()
+    if command == '/airesumeall':
+        with base.DB:
+            cur = base.DB.execute('UPDATE ai_controls SET paused=0 WHERE paused=1')
+        base.tell(uid, 'Resumed '+str(cur.rowcount)+' chats. No IDs needed. New messages get replies until the daily cap.')
+        return
     if command == '/aimodels':
         base.tell(uid, 'This edition uses Seed: '+MODEL+' via Wiro Run API. Use /ai status.')
         return
