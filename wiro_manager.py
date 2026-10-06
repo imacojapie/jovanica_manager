@@ -144,8 +144,6 @@ Pamti samo korisne, dobrovoljno date i relativno bezbedne činjenice i otvorene 
 ODNOS I NOVAC:
 Budi flertujuća i zabavna, ali ne izmišljaj ljubav, ekskluzivnost ili stvarnu vezu. Ne govori „ako me voliš plati“, ne pravi ljubomoru zbog novca, ne izmišljaj hitne slučajeve/račune/problem da bi izvukla uplatu. Plaćanje ne kupuje emotivnu naklonost.
 
-MALOLETNI:
-Ako korisnik kaže ili jasno pokaže da ima manje od 18 godina, nema seksualnog flerta, premium/explicit prodaje ni Fanvue pitch-a. Prebaci razgovor na neutralno ili ga prekini.
 
 AI IDENTITET:
 Profil je AI/virtuelni kreator. Ne moraš sama da pokrećeš tu temu, ali ako direktno pita da li si AI, bot ili prava osoba, ne laži. Odgovori kratko i prirodno, npr. „ai profil sam hahah“ ili „virtuelna sam“, pa nastavi normalno.
@@ -166,6 +164,29 @@ OLD_CONNECTION = base.connection
 STARTED = time.time()
 CONNECTIONS = {}
 
+
+def declared_age_block(text):
+    """Return True only for an explicit first-person declaration below 18.
+    Runs locally before any Wiro request; never becomes part of the model prompt.
+    """
+    t = re.sub(r'\s+', ' ', (text or '').strip().lower())
+
+    patterns = [
+        r'\bimam\s+(\d{1,2})\s*(?:godina|godine|god|g)\b',
+        r'\bja\s+imam\s+(\d{1,2})\b',
+        r"\bi(?:'m| am)\s+(\d{1,2})\s*(?:years?\s+old|yo|y/o)\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, t, flags=re.I)
+        if m:
+            try:
+                age = int(m.group(1))
+            except ValueError:
+                continue
+            if 0 < age < 18:
+                return True
+    return False
+
 MOVES = {
     'casual','rapport','callback','learn','playful','flirt','tease','pull_back',
     'entertain','reengage','handle_objection','fanvue_bridge','boundary'
@@ -173,7 +194,6 @@ MOVES = {
 INTENTS = {'none','low','medium','high'}
 FANVUE_STATES = {'unknown','unaware','aware','link_sent','says_subscribed'}
 ENGAGEMENT = {'low','medium','high'}
-ADULT_STATUS = {'unknown','adult','minor'}
 
 
 def blank_state():
@@ -184,7 +204,6 @@ def blank_state():
         'commercial_intent': 'none',
         'fanvue_status': 'unknown',
         'engagement': 'medium',
-        'adult_status': 'unknown',
         'last_move': 'casual',
         'next_goal': 'rapport',
     }
@@ -242,9 +261,6 @@ def normalize_state(value, prior=None):
     eng = str(value.get('engagement', state['engagement'])).lower()
     if eng in ENGAGEMENT:
         state['engagement'] = eng
-    adult = str(value.get('adult_status', state['adult_status'])).lower()
-    if adult in ADULT_STATUS:
-        state['adult_status'] = adult
     last_move = str(value.get('last_move', state['last_move'])).lower()
     if last_move in MOVES:
         state['last_move'] = last_move
@@ -435,7 +451,6 @@ Vrati SAMO validan JSON objekat, bez markdown fence-a i bez dodatnog teksta, ta�
     "commercial_intent": "none",
     "fanvue_status": "unknown",
     "engagement": "medium",
-    "adult_status": "unknown",
     "last_move": "casual",
     "next_goal": "rapport"
   }
@@ -445,7 +460,6 @@ relationship_stage: 0 stranger, 1 familiar, 2 regular, 3 flirty regular, 4 high 
 commercial_intent mora biti none/low/medium/high.
 fanvue_status mora biti unknown/unaware/aware/link_sent/says_subscribed.
 engagement mora biti low/medium/high.
-adult_status mora biti unknown/adult/minor. Ne zaključuj adult samo iz flerta; menjaj ga kada postoje stvarni podaci o godinama.
 last_move i next_goal moraju biti jedan od: casual, rapport, callback, learn, playful, flirt, tease, pull_back, entertain, reengage, handle_objection, fanvue_bridge, boundary.
 
 "reply" je JEDINO što će korisnik videti. Memory mora biti kratka, stabilna i korisna za sledeće poteze. Ne stavljaj interno objašnjenje u reply.
@@ -670,6 +684,15 @@ def drain_events():
                 body = m.get('text','').strip()
                 if body.lower() == '/stop':
                     cancel(cid,key)
+                elif body and declared_age_block(body):
+                    cancel(cid,key)
+                    with base.DB:
+                        base.DB.execute('INSERT OR IGNORE INTO ai_controls(cid,chat) VALUES (?,?)', (cid,key))
+                        base.DB.execute('UPDATE ai_controls SET paused=1 WHERE cid=? AND chat=?', (cid,key))
+                    result = base.api('sendMessage', business_connection_id=cid, chat_id=int(key),
+                                      text='ne mogu da nastavim taj tip razgovora')
+                    history(cid,key,result['message_id'],'assistant','ne mogu da nastavim taj tip razgovora')
+                    note(cid,key,'age_gate','Explicit age declaration blocked locally before model request')
                 elif (body and not body.startswith('/') and not sender.get('is_bot')
                       and base.OWNER and reply_ok and allowed(cid,key)):
                     if received >= STARTED and m['date'] < STARTED-300:
