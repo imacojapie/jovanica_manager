@@ -1,15 +1,19 @@
-"""Wiro strategic memory + 4-model toggle edition, v6.3. Standard library only. Keep bot.py beside this file.
+"""Wiro strategic memory + 7-model toggle edition, v6.4. Standard library only. Keep bot.py beside this file.
 
 Upgrades over queue v5:
 - Persistent per-user strategic memory in SQLite (facts, open loops, relationship stage,
   commercial intent, Fanvue state, current/next conversational move).
 - One paid Seed request per reply: the same generation returns both the visible reply and
   a compact hidden state update. No second "memory" model call.
-- Four selectable Wiro models. Switch with /ai1 /ai2 /ai3 /ai4 or /aimodel 1/2/3/4.
-- Slot 4 is Grok 4.1 Fast via the existing WIRO_API_KEY.
+- Seven selectable Wiro models. Switch with /ai1 through /ai7 or /aimodel 1 through 7.
+- Slot 4: Grok 4.1 Fast. Slot 5: DeepSeek V4 Flash.
+- Slot 6: Qwen3.8-27B (thinking off). Slot 7: Claude Sonnet 5.
+- All slots use the existing WIRO_API_KEY. No extra API keys.
 - Complete replacement for wiro_manager.py. Run: python wiro_manager.py
 - Reasoning effort defaults to HIGH for slots 1-3 via WIRO_REASONING_EFFORT=high.
 - Grok uses provider defaults; its requests omit the unsupported effort parameter.
+- DeepSeek and Claude use provider reasoning defaults; Qwen sends enableThinking=false.
+- The global WIRO_REASONING_EFFORT only overrides slots 1-3.
 - Fanvue link is injected ONLY when the model deliberately emits [FANVUE]. Keyword-based
   accidental link injection is removed.
 - Recent-message history stays capped at 20, while durable profile memory survives beyond it.
@@ -53,6 +57,28 @@ MODELS = {
         'slug': 'xai/grok-4-1-fast',
         'user_field': 'user_id',
         'supports_effort': False,
+    },
+    '5': {
+        'name': 'DeepSeek V4 Flash',
+        'slug': 'deepseek/v4-flash',
+        'user_field': 'user_id',
+        'supports_effort': False,
+        'reasoning_label': 'provider default (effort not overridden)',
+    },
+    '6': {
+        'name': 'Qwen3.8-27B',
+        'slug': 'qwen/qwen3-8-27b',
+        'user_field': 'user_id',
+        'supports_effort': False,
+        'reasoning_label': 'thinking off',
+        'extra_payload': {'enableThinking': 'false'},
+    },
+    '7': {
+        'name': 'Claude Sonnet 5',
+        'slug': 'claude/sonnet-5',
+        'user_field': 'user_id',
+        'supports_effort': False,
+        'reasoning_label': 'provider default (effort not overridden)',
     },
 }
 DEFAULT_MODEL_SLOT = os.getenv('AI_MODEL_SLOT', '1').strip()
@@ -205,6 +231,8 @@ def active_model():
 
 def reasoning_label(model_slot=None):
     slot = active_model_slot() if model_slot is None else model_slot
+    if MODELS[slot].get('reasoning_label'):
+        return MODELS[slot]['reasoning_label']
     if not MODELS[slot].get('supports_effort', True):
         return 'provider default (no effort dial)'
     return REASONING
@@ -218,8 +246,8 @@ def model_list_text():
         marker = '  ← ACTIVE' if slot == current else ''
         lines.append(slot + '. ' + item['name'] + '\n   ' + item['slug'] + marker)
     lines.append('')
-    lines.append('Switch: /ai1  /ai2  /ai3  /ai4')
-    lines.append('or: /aimodel 1|2|3|4')
+    lines.append('Switch: /ai1  /ai2  /ai3  /ai4  /ai5  /ai6  /ai7')
+    lines.append('or: /aimodel 1|2|3|4|5|6|7')
     lines.append('Reasoning: ' + reasoning_label(current))
     return '\n'.join(lines)
 
@@ -411,7 +439,7 @@ def wiro_request(payload, model_slot):
     request = urllib.request.Request('https://api.wiro.ai/v1/Run/' + model['slug'] + '/sync',
         data=json.dumps(payload).encode(), headers={
             'Content-Type':'application/json', 'Accept':'application/json',
-            'User-Agent':'JovanicaManager/6.3', 'x-api-key':KEY})
+            'User-Agent':'JovanicaManager/6.4', 'x-api-key':KEY})
     try:
         with urllib.request.urlopen(request, timeout=55) as response:
             data = json.load(response)
@@ -535,10 +563,12 @@ last_move i next_goal moraju biti jedan od: casual, rapport, callback, learn, pl
         'prompt': prompt,
         'session_id': session,
     }
-    # Grok does not support the effort dial used by slots 1-3.
+    # Only slots 1-3 use the existing global effort setting.
+    # Other models use documented per-model inputs or provider defaults.
     if model.get('supports_effort', True):
         payload['effort'] = REASONING
-    # Wiro uses userId for Seed and user_id for GPT-6 Luna / Grok.
+    payload.update(model.get('extra_payload', {}))
+    # Wiro uses userId for Seed and user_id for the other configured models.
     payload[model['user_field']] = session
 
     generated = decode_generation(parse_answer(wiro_request(payload, model_slot)), state)
@@ -548,12 +578,15 @@ last_move i next_goal moraju biti jedan od: casual, rapport, callback, learn, pl
 
 
 HELP = '''Wiro AI controls (owner only):
-/aimodels — show models 1/2/3/4 and active model
+/aimodels — show models 1/2/3/4/5/6/7 and active model
 /ai1 — switch to model 1: Seed V2 Pro Uncensored
 /ai2 — switch to model 2: Seed V2.1 Turbo Uncensored
 /ai3 — switch to model 3: GPT-6 Luna
 /ai4 — switch to model 4: Grok 4.1 Fast
-/aimodel 1|2|3|4 — same switch, long form
+/ai5 — switch to model 5: DeepSeek V4 Flash
+/ai6 — switch to model 6: Qwen3.8-27B
+/ai7 — switch to model 7: Claude Sonnet 5
+/aimodel 1|2|3|4|5|6|7 — same switch, long form
 /ai test ID — enable only one test recipient
 /ai on | /ai off | /ai status
 /aipause ID — pause one chat
@@ -568,7 +601,7 @@ Only ONE Wiro request runs at a time. Switching models affects the next generati
 
 def process(uid,m,text):
     command, _, arg = text.partition(' ')
-    if command not in ('/ai','/aimodel','/aimodels','/ai1','/ai2','/ai3','/ai4',
+    if command not in ('/ai','/aimodel','/aimodels','/ai1','/ai2','/ai3','/ai4','/ai5','/ai6','/ai7',
                        '/aipause','/airesume','/airesumeall','/aiforget','/aiprofile'):
         return OLD_PROCESS(uid,m,text)
     if uid != base.OWNER:
@@ -583,7 +616,7 @@ def process(uid,m,text):
         base.tell(uid, model_list_text())
         return
 
-    if command in ('/ai1','/ai2','/ai3','/ai4'):
+    if command in ('/ai1','/ai2','/ai3','/ai4','/ai5','/ai6','/ai7'):
         slot = command[-1]
         base.put('ai_model_slot', slot)
         model = MODELS[slot]
@@ -596,7 +629,7 @@ def process(uid,m,text):
     if command == '/aimodel':
         slot = arg.strip()
         if slot not in MODELS:
-            raise ValueError('Use /aimodel 1, /aimodel 2, /aimodel 3 or /aimodel 4.')
+            raise ValueError('Use /aimodel followed by a number from 1 to 7.')
         base.put('ai_model_slot', slot)
         model = MODELS[slot]
         base.tell(uid, 'AI model switched to '+slot+': '+model['name']+
@@ -721,7 +754,7 @@ def initialize(path):
         base.DB.execute("UPDATE ai_queue SET status='interrupted' WHERE status IN ('pending','generating','sending')")
         base.DB.execute('DELETE FROM ai_q5_jobs WHERE updated<?', (time.time()-7*86400,))
         base.DB.execute("DELETE FROM ai_q5_events WHERE status='blocked' AND received<?", (time.time()-7*86400,))
-    base.put('ai_adapter_version', 'wiro-strategy-v6.3-model-toggle')
+    base.put('ai_adapter_version', 'wiro-strategy-v6.4-model-toggle')
     saved_slot = str(base.get('ai_model_slot', DEFAULT_MODEL_SLOT))
     if saved_slot not in MODELS:
         base.put('ai_model_slot', DEFAULT_MODEL_SLOT)
@@ -953,7 +986,7 @@ def queue_report(key=''):
     used = base.DB.execute('SELECT COALESCE(SUM(count),0) FROM ai_usage WHERE day=?',(day,)).fetchone()[0]
     slot = active_model_slot()
     model = MODELS[slot]
-    return ('Strategy v6.3 | model '+slot+': '+model['name']+' | workers: '+str(len(RUNNING))+
+    return ('Strategy v6.4 | model '+slot+': '+model['name']+' | workers: '+str(len(RUNNING))+
         '/1 | reasoning: '+reasoning_label(slot)+' | today: '+str(used)+'/'+str(DAILY)+' attempts\n'
         +'Waiting (up to 20 chats):\n'+('\n'.join(chat+': '+str(n)+' messages' for chat,n in waiting) or 'none')
         +'\nRecent attempts:\n'+('\n'.join(chat+': '+status+(' — '+detail if detail else '') for chat,status,detail in jobs) or 'none')
